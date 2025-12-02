@@ -1,0 +1,7 @@
+{
+    "architectures": [
+        "TransNetV2"
+    ],
+    "model_type": "custom",
+    "vocab_size": 0
+}

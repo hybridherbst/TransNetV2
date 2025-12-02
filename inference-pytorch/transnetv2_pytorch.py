@@ -87,6 +87,27 @@ class TransNetV2(nn.Module):
         return one_hot
 
 
+class Pool3dAs2d(nn.Module):
+    def __init__(self, pool_type="avg"):
+        super(Pool3dAs2d, self).__init__()
+        if pool_type == "avg":
+            self.pool = nn.AvgPool2d(kernel_size=(2, 2))
+        else:
+            self.pool = nn.MaxPool2d(kernel_size=(2, 2))
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        B, C, T, H, W = x.shape
+        # Reshape to [B*T, C, H, W] for 2D pooling
+        x = x.transpose(1, 2).reshape(B * T, C, H, W)
+        x = self.pool(x)
+        # Reshape back to [B, C, T, H/2, W/2]
+        # Note: H and W are halved by pooling
+        H_new, W_new = x.shape[2], x.shape[3]
+        x = x.reshape(B, T, C, H_new, W_new).transpose(1, 2)
+        return x
+
+
 class StackedDDCNNV2(nn.Module):
 
     def __init__(self,
@@ -111,7 +132,8 @@ class StackedDDCNNV2(nn.Module):
             DilatedDCNNV2(in_filters if i == 1 else filters * 4, filters, octave_conv=use_octave_conv,
                           activation=functional.relu if i != n_blocks else None) for i in range(1, n_blocks + 1)
         ])
-        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2)) if pool_type == "max" else nn.AvgPool3d(kernel_size=(1, 2, 2))
+        # Use custom 2D pooling wrapper to avoid WebGPU 3D pooling issues
+        self.pool = Pool3dAs2d(pool_type)
         self.stochastic_depth_drop_prob = stochastic_depth_drop_prob
 
     def forward(self, inputs):
@@ -202,19 +224,34 @@ class Conv3DConfigurable(nn.Module):
 
         if separable:
             # (2+1)D convolution https://arxiv.org/pdf/1711.11248.pdf
+            self.pad1 = nn.ConstantPad3d((1, 1, 1, 1, 0, 0), 0)
             conv1 = nn.Conv3d(in_filters, 2 * filters, kernel_size=(1, 3, 3),
-                              dilation=(1, 1, 1), padding=(0, 1, 1), bias=False)
+                              dilation=(1, 1, 1), padding=(0, 0, 0), bias=False)
+            
+            self.pad2 = nn.ConstantPad3d((0, 0, 0, 0, dilation_rate, dilation_rate), 0)
             conv2 = nn.Conv3d(2 * filters, filters, kernel_size=(3, 1, 1),
-                              dilation=(dilation_rate, 1, 1), padding=(dilation_rate, 0, 0), bias=use_bias)
+                              dilation=(dilation_rate, 1, 1), padding=(0, 0, 0), bias=use_bias)
             self.layers = nn.ModuleList([conv1, conv2])
         else:
+            # Standard 3D convolution
+            # kernel=3, dilation=(d,1,1), padding=(d,1,1)
+            # Pad: (1,1, 1,1, d,d)
+            self.pad1 = nn.ConstantPad3d((1, 1, 1, 1, dilation_rate, dilation_rate), 0)
             conv = nn.Conv3d(in_filters, filters, kernel_size=3,
-                             dilation=(dilation_rate, 1, 1), padding=(dilation_rate, 1, 1), bias=use_bias)
+                             dilation=(dilation_rate, 1, 1), padding=(0, 0, 0), bias=use_bias)
             self.layers = nn.ModuleList([conv])
 
     def forward(self, inputs):
         x = inputs
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if len(self.layers) == 2:
+                if i == 0:
+                    x = self.pad1(x)
+                elif i == 1:
+                    x = self.pad2(x)
+            else:
+                # Non-separable case
+                x = self.pad1(x)
             x = layer(x)
         return x
 
@@ -287,11 +324,22 @@ class ColorHistograms(nn.Module):
         frames_flatten = frames.view(batch_size * time_window, height * width, 3)
 
         binned_values = get_bin(frames_flatten)
-        frame_bin_prefix = (torch.arange(0, batch_size * time_window, device=frames.device) << 9).view(-1, 1)
+        
+        # Dynamic shape handling for ONNX export
+        # Create indices 0..B*T-1 dynamically
+        flat_batch_time = frames[:, :, 0, 0, 0].reshape(-1) # [B*T]
+        indices = torch.nonzero(torch.ones_like(flat_batch_time)).view(-1)
+        frame_bin_prefix = (indices << 9).view(-1, 1)
+        
         binned_values = (binned_values + frame_bin_prefix).view(-1)
 
-        histograms = torch.zeros(batch_size * time_window * 512, dtype=torch.int32, device=frames.device)
-        histograms.scatter_add_(0, binned_values, torch.ones(len(binned_values), dtype=torch.int32, device=frames.device))
+        # Dynamic histograms initialization
+        # Size: B*T*512
+        # Expand flat_batch_time to correct size and create zeros
+        zero_template = flat_batch_time.unsqueeze(-1).expand(-1, 512).reshape(-1)
+        histograms = torch.zeros_like(zero_template, dtype=torch.int32)
+        
+        histograms.scatter_add_(0, binned_values, torch.ones_like(binned_values, dtype=torch.int32))
 
         histograms = histograms.view(batch_size, time_window, 512).float()
         histograms_normalized = functional.normalize(histograms, p=2, dim=2)
